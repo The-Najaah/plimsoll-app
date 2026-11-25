@@ -3,7 +3,7 @@
 import { safeHref } from "@/lib/safe-href";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   Tier,
   ago,
@@ -31,6 +31,7 @@ import {
   statusOf,
 } from "@/components/ui";
 import { assetFromSearch } from "@/lib/asset-query";
+import { AssetTitleManager, formatAssetTitle } from "@/lib/asset-title";
 import { config, explorer } from "@/lib/config";
 import { embedCode } from "@/lib/badge";
 import {
@@ -54,16 +55,38 @@ export default function AssetPage() {
 function AssetDetail() {
   const query = assetFromSearch(useSearchParams().toString(), config.network.networkPassphrase);
   const sac = query.ok ? query.sac : "";
-  const [asset, setAsset] = useState<AssetView | null | undefined>(undefined);
-  const [error, setError] = useState<string | null>(null);
+  const [loadedAsset, setLoadedAsset] = useState<{
+    sac: string;
+    asset: AssetView | null;
+  } | null>(null);
+  const [error, setError] = useState<{ sac: string; message: string } | null>(null);
   const [now, setNow] = useState(nowSecs());
   const [names, setNames] = useState<ReadonlyMap<string, string>>(new Map());
+  const titleManager = useRef<AssetTitleManager | null>(null);
+  const currentAsset = loadedAsset?.sac === sac ? loadedAsset.asset : undefined;
+  const currentCoverage = currentAsset?.coverage;
+  const currentError = error?.sac === sac ? error.message : null;
+  const title =
+    query.ok && !currentError && currentAsset && currentCoverage
+      ? formatAssetTitle(
+          currentAsset.code,
+          currentCoverage.bps,
+          statusOf(
+            currentCoverage.bps,
+            currentCoverage.reportAsOf,
+            currentCoverage.supplyPostedAt,
+            now,
+          ),
+        )
+      : null;
 
   useEffect(() => {
+    let cancelled = false;
     if (!sac) return;
     loadAsset(sac)
       .then((a) => {
-        setAsset(a);
+        if (cancelled) return;
+        setLoadedAsset({ sac, asset: a });
         setNow(nowSecs());
         if (!a) return;
         const addresses = Object.values(a.reports)
@@ -73,11 +96,29 @@ function AssetDetail() {
         // Names are an improvement on the addresses already shown, not a
         // precondition for them, so a failed lookup leaves the page as it is.
         loadReporterNames(addresses)
-          .then(setNames)
-          .catch((e: unknown) => console.warn("Could not load reporter names", e));
+          .then((loadedNames) => {
+            if (!cancelled) setNames(loadedNames);
+          })
+          .catch((e: unknown) => {
+            if (!cancelled) console.warn("Could not load reporter names", e);
+          });
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setError({ sac, message: e instanceof Error ? e.message : String(e) });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [sac]);
+
+  useEffect(() => {
+    titleManager.current ??= new AssetTitleManager(document);
+    titleManager.current.update(title);
+  }, [title]);
+
+  useEffect(() => () => titleManager.current?.restore(), []);
 
   if (!query.ok) {
     return (
@@ -98,13 +139,13 @@ function AssetDetail() {
       </section>
     );
   }
-  if (error)
+  if (currentError)
     return (
       <p className="notice notice-bad" role="alert">
-        Could not load this asset: {error}
+        Could not load this asset: {currentError}
       </p>
     );
-  if (asset === undefined) {
+  if (currentAsset === undefined) {
     return (
       <div style={{ display: "grid", gap: 14 }}>
         <Skeleton height={40} width="30%" />
@@ -113,7 +154,7 @@ function AssetDetail() {
       </div>
     );
   }
-  if (asset === null) {
+  if (currentAsset === null) {
     return (
       <p className="notice notice-info">
         This asset is not listed on the coverage ledger. <Link href="/list/">List it</Link>.
@@ -121,6 +162,7 @@ function AssetDetail() {
     );
   }
 
+  const asset = currentAsset;
   const c = asset.coverage;
   const status = statusOf(c?.bps, c?.reportAsOf, c?.supplyPostedAt, now);
   const tiers = [Tier.AuditorSigned, Tier.IssuerSigned, Tier.Transcribed];
